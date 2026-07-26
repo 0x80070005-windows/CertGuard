@@ -1,10 +1,12 @@
 using System;
 using System.IO;
+using System.Security.Cryptography;
 using FileCrypto;
-using init;
-using DeviceAuthentication1;   // ← пространство имён, где лежит CertAutDevice
+using CertGuard.Init;
+using DeviceAuthentication1;
 
-init.init.master_init();
+// Инициализация
+Initializer.master_init();
 
 if (args.Length == 1 && File.Exists(args[0]) &&
     Path.GetExtension(args[0]).Equals(".enc", StringComparison.OrdinalIgnoreCase))
@@ -23,15 +25,15 @@ static void HandleFileOpen(string filePath)
     Console.WriteLine($"Обнаружен зашифрованный файл: {filePath}");
     Console.WriteLine("------------------------------------------------");
 
-    if (!CheckDeviceOrFail())
+    byte[]? masterKey = GetMasterKeyOrFail();
+    if (masterKey == null)
         return;
 
     string? password = AskPasswordOrFail();
     if (password == null)
         return;
 
-    DoDecrypt(filePath, password);
-
+    DoDecrypt(filePath, password, masterKey);
     Console.WriteLine("Нажмите Enter для выхода...");
     Console.ReadLine();
 }
@@ -70,8 +72,9 @@ static void ShowMenu()
 
 static void EncryptFile()
 {
-    // Если хотите проверять устройство и при шифровании – раскомментируйте:
-    // if (!CheckDeviceOrFail()) return;
+    byte[]? masterKey = GetMasterKeyOrFail();
+    if (masterKey == null)
+        return;
 
     Console.Write("Введите путь к файлу для шифрования: ");
     string? inputFile = Console.ReadLine();
@@ -84,7 +87,7 @@ static void EncryptFile()
     }
 
     Console.Write("Введите пароль: ");
-    string? password = Console.ReadLine();
+    string? password = ReadPassword();
     if (string.IsNullOrEmpty(password))
     {
         Console.WriteLine("Пароль не может быть пустым.");
@@ -94,8 +97,9 @@ static void EncryptFile()
     string encryptedFile = inputFile + ".enc";
     try
     {
-        CryptoModule.Encrypt(inputFile, encryptedFile, password);
-        Console.WriteLine($"Файл зашифрован: {encryptedFile}");
+        byte[] masterKeyHash = SHA256.HashData(masterKey);
+        CryptoModule.Encrypt(inputFile, encryptedFile, password, masterKeyHash);
+        Console.WriteLine($"✓ Файл зашифрован: {encryptedFile}");
     }
     catch (Exception ex)
     {
@@ -105,7 +109,8 @@ static void EncryptFile()
 
 static void DecryptFile()
 {
-    if (!CheckDeviceOrFail())
+    byte[]? masterKey = GetMasterKeyOrFail();
+    if (masterKey == null)
         return;
 
     Console.Write("Введите путь к зашифрованному файлу (.enc): ");
@@ -128,59 +133,111 @@ static void DecryptFile()
     if (password == null)
         return;
 
-    DoDecrypt(inputFile, password);
+    DoDecrypt(inputFile, password, masterKey);
 }
 
 // ===================== Общие вспомогательные методы =====================
 
-static bool CheckDeviceOrFail()
+static byte[]? GetMasterKeyOrFail()
 {
-    Console.WriteLine("Проверка устройства подтверждения...");
+    Console.WriteLine("Проверка устройства и получение мастер-ключа...");
+    byte[]? masterKey = CertAutDevice.GetMasterKey();
 
-    bool ok;
-    try
+    if (masterKey == null)
     {
-        // ИСПРАВЛЕНО: вызываем правильный метод CAD()
-        ok = CertAutDevice.CAD();
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"ОШИБКА проверки устройства: {ex.Message}");
-        ok = false;
+        Console.WriteLine("Обычная проверка не удалась.");
+        Console.Write("Введите резервный мастер-ключ (или оставьте пустым для выхода): ");
+        string? backupKey = Console.ReadLine()?.Trim();
+
+        if (string.IsNullOrEmpty(backupKey))
+        {
+            Console.WriteLine("Доступ запрещён.");
+            return null;
+        }
+
+        try
+        {
+            byte[] backupBytes = Convert.FromHexString(backupKey);
+            if (backupBytes.Length != 32)
+                throw new FormatException("Ключ должен быть 64 шестнадцатеричных символа.");
+
+            string expectedHash = File.ReadAllText(Initializer.GetSettingsFile()).Trim();
+            byte[] hash = SHA512.HashData(backupBytes);
+            string actualHash = Convert.ToHexString(hash);
+
+            if (string.Equals(actualHash, expectedHash, StringComparison.Ordinal))
+            {
+                Console.WriteLine("Резервный ключ верный. Доступ разрешён.");
+                return backupBytes;
+            }
+            else
+            {
+                Console.WriteLine("Неверный резервный ключ.");
+                return null;
+            }
+        }
+        catch (FormatException)
+        {
+            Console.WriteLine("Некорректный формат ключа (должен быть в шестнадцатеричном виде).");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка проверки резервного ключа: {ex.Message}");
+            return null;
+        }
     }
 
-    if (!ok)
-    {
-        Console.WriteLine("ДОСТУП ЗАПРЕЩЁН: устройство подтверждения не найдено или не прошло проверку.");
-        return false;
-    }
+    Console.WriteLine("✓ Устройство подтверждено.");
+    return masterKey;
+}
 
-    Console.WriteLine("Устройство подтверждено.");
-    return true;
+static string ReadPassword()
+{
+    string password = "";
+    ConsoleKeyInfo key;
+    do
+    {
+        key = Console.ReadKey(true);
+        if (key.Key == ConsoleKey.Backspace && password.Length > 0)
+        {
+            password = password.Remove(password.Length - 1);
+            Console.Write("\b \b");
+        }
+        else if (key.Key == ConsoleKey.Enter)
+        {
+            Console.WriteLine();
+            break;
+        }
+        else if (key.Key != ConsoleKey.Backspace && key.Key != ConsoleKey.Enter)
+        {
+            password += key.KeyChar;
+            Console.Write("*");
+        }
+    } while (true);
+    return password;
 }
 
 static string? AskPasswordOrFail()
 {
     Console.Write("Введите пароль для расшифровки: ");
-    string? password = Console.ReadLine();
-
-    //| password != "Treecode1
+    string? password = ReadPassword();
     if (string.IsNullOrEmpty(password))
     {
         Console.WriteLine("ОШИБКА: неверный пароль.");
         return null;
     }
-
     return password;
 }
 
-static void DoDecrypt(string filePath, string password)
+static void DoDecrypt(string filePath, string password, byte[] masterKey)
 {
     string outputFile = Path.ChangeExtension(filePath, null);
     try
     {
-        CryptoModule.Decrypt(filePath, outputFile, password);
-        Console.WriteLine($"Файл успешно расшифрован: {outputFile}");
+        byte[] masterKeyHash = SHA256.HashData(masterKey);
+        CryptoModule.Decrypt(filePath, outputFile, password, masterKeyHash);
+        Console.WriteLine($"✓ Файл успешно расшифрован: {outputFile}");
     }
     catch (Exception ex)
     {

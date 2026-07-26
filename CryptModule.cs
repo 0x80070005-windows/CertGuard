@@ -7,12 +7,16 @@ namespace FileCrypto
     public static class CryptoModule
     {
         const int ChunkSize = 450 * 1024 * 1024;
-        const int SaltSize = 100;
-        const int NonceSize = 100;
-        const int TagSize = 100;
+        const int SaltSize = 32;
+        const int NonceSize = 12;
+        const int TagSize = 16;
+        const int KeyHashSize = 32;
 
-        public static void Encrypt(string inputPath, string outputPath, string password)
+        public static void Encrypt(string inputPath, string outputPath, string password, byte[] masterKeyHash)
         {
+            if (masterKeyHash.Length != KeyHashSize)
+                throw new ArgumentException("Хеш мастер-ключа должен быть 32 байта");
+
             byte[] salt = RandomNumberGenerator.GetBytes(SaltSize);
             byte[] baseNonce = RandomNumberGenerator.GetBytes(NonceSize);
             byte[] key = DeriveKey(password, salt);
@@ -20,10 +24,11 @@ namespace FileCrypto
             using var input = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
             using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write);
 
+            // Пишем хеш мастер-ключа (32 байта)
+            output.Write(masterKeyHash, 0, KeyHashSize);
+
             long totalSize = input.Length;
-            ulong chunkCount = totalSize == 0
-                ? 1
-                : (ulong)((totalSize + ChunkSize - 1) / ChunkSize);
+            ulong chunkCount = totalSize == 0 ? 1 : (ulong)((totalSize + ChunkSize - 1) / ChunkSize);
 
             output.Write(salt);
             output.Write(baseNonce);
@@ -61,9 +66,19 @@ namespace FileCrypto
             output.Write(ciphertext);
         }
 
-        public static void Decrypt(string inputPath, string outputPath, string password)
+        public static void Decrypt(string inputPath, string outputPath, string password, byte[] expectedMasterKeyHash)
         {
+            if (expectedMasterKeyHash.Length != KeyHashSize)
+                throw new ArgumentException("Ожидаемый хеш мастер-ключа должен быть 32 байта");
+
             using var input = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
+
+            // Читаем сохранённый хеш мастер-ключа
+            byte[] storedHash = new byte[KeyHashSize];
+            ReadExact(input, storedHash);
+
+            if (!storedHash.SequenceEqual(expectedMasterKeyHash))
+                throw new CryptographicException("Мастер-ключ не соответствует файлу.");
 
             byte[] salt = new byte[SaltSize];
             byte[] baseNonce = new byte[NonceSize];
@@ -107,16 +122,16 @@ namespace FileCrypto
 
         static byte[] DeriveKey(string password, byte[] salt)
         {
-            using var pbkdf2 = new Rfc2898DeriveBytes(
-                password, salt, 100_000, HashAlgorithmName.SHA256);
-            return pbkdf2.GetBytes(32);
+            return Rfc2898DeriveBytes.Pbkdf2(password, salt, 100_000, HashAlgorithmName.SHA256, 32);
         }
 
         static byte[] MakeChunkNonce(byte[] baseNonce, ulong chunkIndex)
         {
             byte[] nonce = (byte[])baseNonce.Clone();
             byte[] counterBytes = BitConverter.GetBytes(chunkIndex);
-            Buffer.BlockCopy(counterBytes, 0, nonce, NonceSize - 8, 8);
+            int offset = NonceSize - 8;
+            if (offset < 0) offset = 0;
+            Buffer.BlockCopy(counterBytes, 0, nonce, offset, Math.Min(8, NonceSize));
             return nonce;
         }
 

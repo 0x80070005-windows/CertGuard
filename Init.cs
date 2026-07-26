@@ -1,62 +1,112 @@
+using System;
 using System.Diagnostics;
-
+using System.Runtime.InteropServices;
 using DeviceAuthentication1;
 using CreateSertificate;
 
-namespace init
+namespace CertGuard.Init
 {
-    public static class init
+    public static class Initializer
     {
+        private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        private static bool IsLinux => RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+
+        public static string GetCertificateDir()
+        {
+            string certDir = IsWindows
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CertGuard")
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".CertGuard");
+
+            return certDir;
+        }
+
+        public static string GetSettingsFile()
+        {
+            return Path.Combine(GetCertificateDir(), ".WPS_Setting");
+        }
+
         public static void master_init()
         {
-            string FolderPath = @"/mnt/temp/";
-            if (Directory.Exists(FolderPath))
+            try
             {
-                Console.WriteLine("Find folder = true");
-            }
-            else
-            {
-                var proccesInfo = new ProcessStartInfo
+                string certDir = GetCertificateDir();
+                if (!Directory.Exists(certDir))
                 {
-                    FileName = "sudo bash",
-                    Arguments = "CreateTempFolder.sh",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
+                    Directory.CreateDirectory(certDir);
+                    Console.WriteLine($"Директория создана: {certDir}");
+                }
 
-                using var process = Process.Start(proccesInfo);
-                process?.WaitForExit();
-            }
-	    
-            string DeviceTemp = @"/mnt/temp/Device";
-            if (File.Exists(DeviceTemp))
-            {
-                Console.WriteLine("Find temp file = true");
-            }
-            else
-            {
-                Console.Write("Введите директорию доверенного устройства (заканчивать на /) -");
-                string? device = Console.ReadLine();
-                File.WriteAllText("/mnt/temp/Device", device);
-            }
-	
-            if (!File.Exists(".WPS_Setting"))
-            {
-                CreateSertificate.CS.Master_CS();
-            }
+                string FolderPath = IsWindows ? @"C:\Temp\CertGuard\" : @"/mnt/temp/";
+                
+                if (Directory.Exists(FolderPath))
+                {
+                    Console.WriteLine("Find folder = true");
+                }
+                else
+                {
+                    if (IsLinux)
+                    {
+                        var processInfo = new ProcessStartInfo
+                        {
+                            FileName = "/bin/bash",
+                            Arguments = "-c \"sudo mkdir -p " + FolderPath + "\"",
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
 
-            // ===== ВАЖНО: проверяем устройство и завершаем, если не пройдено =====
-            bool deviceOk = CertAutDevice.CAD();
-            if (!deviceOk)
+                        using var process = Process.Start(processInfo);
+                        process?.WaitForExit();
+                    }
+                    else if (IsWindows)
+                    {
+                        Directory.CreateDirectory(FolderPath);
+                    }
+                }
+
+                string DeviceTemp = Path.Combine(FolderPath, "Device");
+                
+                if (File.Exists(DeviceTemp))
+                {
+                    Console.WriteLine("Find temp file = true");
+                }
+                else
+                {
+                    Console.Write("Введите директорию доверенного устройства (заканчивать на / или \\) - ");
+                    string? device = Console.ReadLine();
+                    File.WriteAllText(DeviceTemp, device);
+                }
+
+                if (!File.Exists(GetSettingsFile()))
+                {
+                    try
+                    {
+                        CreateSertificate.CS.Master_CS();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Ошибка создания сертификатов: {ex.Message}");
+                        Console.WriteLine("Устройство не прошло проверку (ошибка записи на флешку или в системный каталог).");
+                        Environment.Exit(1);
+                    }
+                }
+
+                bool deviceOk = CertAutDevice.GetMasterKey() != null;
+                if (deviceOk)
+                {
+                    Console.WriteLine("✓ Устройство подтверждено.");
+                }
+                else
+                {
+                    Console.WriteLine("⚠ ВНИМАНИЕ: Доверенное устройство не найдено.");
+                    Console.WriteLine("  Вы сможете использовать программу с резервным ключом.");
+                }
+            }
+            catch (Exception ex)
             {
-                Console.WriteLine("ДОСТУП ЗАПРЕЩЁН: устройство не прошло проверку.");
+                Console.WriteLine($"Критическая ошибка инициализации: {ex.Message}");
                 Environment.Exit(1);
-            }
-            else
-            {
-                Console.WriteLine("Устройство подтверждено.");
             }
         }
     }

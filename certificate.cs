@@ -1,128 +1,111 @@
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
-using CertGuard.Services;
+using CertGuard.Init;
 
 namespace DeviceAuthentication1
 {
     public static class CertAutDevice
     {
-        public static bool CAD()
+        private const int HalfKeySize = 16;
+        private const int SaltSize = 16;
+        private const int HmacSize = 32;
+        private const int MasterKeySize = 32;
+
+        private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        public static byte[]? GetMasterKey()
         {
-            const string DevicePathFile = "/mnt/temp/Device";
             const string CertFileName = "certificate.cer";
-            const string CertSystem = "/home/kirill/.local/share/nautilus/tags/meta.dbnew";
-            const string SettingsFile = ".WPS_Setting";
+            string SettingsFile = Initializer.GetSettingsFile();
+
+            string DevicePathFile = IsWindows ? @"C:\Temp\CertGuard\Device" : "/mnt/temp/Device";
+            string CertSystem = IsWindows
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                              "CertGuard", "meta.dbnew")
+                : "/home/" + Environment.UserName + "/.local/share/nautilus/tags/meta.dbnew";
 
             try
             {
-                // 1. Проверяем существование настроечного файла
+                // 1. Проверяем эталонный хеш
                 if (!File.Exists(SettingsFile))
-                {
-                    return false;
-                }
-
+                    return null;
                 string expectedHash = File.ReadAllText(SettingsFile).Trim();
-                //Console.WriteLine($"[ОТЛАДКА] Ожидаемый хеш (из .WPS_Setting): {expectedHash}");
 
                 // 2. Читаем путь к устройству
                 if (!File.Exists(DevicePathFile))
-                {
-                    //Console.WriteLine("[ОТЛАДКА] Файл пути устройства не найден: " + DevicePathFile);
-                    return false;
-                }
-
+                    return null;
                 string devicePath = File.ReadAllText(DevicePathFile).Trim();
                 if (string.IsNullOrEmpty(devicePath))
-                {
-                    //Console.WriteLine("[ОТЛАДКА] Путь устройства пуст.");
-                    return false;
-                }
-                //Console.WriteLine($"[ОТЛАДКА] Путь к устройству из {DevicePathFile}: {devicePath}");
+                    return null;
 
-                // 3. Формируем полный путь к сертификату устройства
                 string deviceCertPath = Path.Combine(devicePath, CertFileName);
-                //Console.WriteLine($"[ОТЛАДКА] Ожидаемый путь к сертификату устройства: {deviceCertPath}");
-
                 if (!File.Exists(deviceCertPath))
-                {
-                    //Console.WriteLine("[ОТЛАДКА] Сертификат устройства не найден по пути: " + deviceCertPath);
-                    return false;
-                }
+                    return null;
 
-                string deviceCert = File.ReadAllText(deviceCertPath).Trim();
-                //Console.WriteLine($"[ОТЛАДКА] Содержимое сертификата устройства: '{deviceCert}'");
+                // 3. Читаем данные с флешки (часть1 + соль1 + HMAC1)
+                byte[] deviceData = File.ReadAllBytes(deviceCertPath);
+                if (deviceData.Length != HalfKeySize + SaltSize + HmacSize)
+                    return null;
 
-                // 4. Читаем системный сертификат
+                byte[] part1 = new byte[HalfKeySize];
+                byte[] salt1 = new byte[SaltSize];
+                byte[] hmac1 = new byte[HmacSize];
+                Buffer.BlockCopy(deviceData, 0, part1, 0, HalfKeySize);
+                Buffer.BlockCopy(deviceData, HalfKeySize, salt1, 0, SaltSize);
+                Buffer.BlockCopy(deviceData, HalfKeySize + SaltSize, hmac1, 0, HmacSize);
+
+                // 4. Читаем системный файл (часть2 + соль2 + HMAC2)
                 if (!File.Exists(CertSystem))
-                {
-                    //Console.WriteLine("[ОТЛАДКА] Системный сертификат не найден: " + CertSystem);
-                    return false;
-                }
+                    return null;
+                byte[] systemData = File.ReadAllBytes(CertSystem);
+                if (systemData.Length != HalfKeySize + SaltSize + HmacSize)
+                    return null;
 
-                string systemCert = File.ReadAllText(CertSystem).Trim();
-                //Console.WriteLine($"[ОТЛАДКА] Содержимое системного сертификата: '{systemCert}'");
+                byte[] part2 = new byte[HalfKeySize];
+                byte[] salt2 = new byte[SaltSize];
+                byte[] hmac2 = new byte[HmacSize];
+                Buffer.BlockCopy(systemData, 0, part2, 0, HalfKeySize);
+                Buffer.BlockCopy(systemData, HalfKeySize, salt2, 0, SaltSize);
+                Buffer.BlockCopy(systemData, HalfKeySize + SaltSize, hmac2, 0, HmacSize);
 
-                // 5. Вычисляем хеш от конкатенации
-                string combined = deviceCert + systemCert;
-                byte[] inputBytes = Encoding.UTF8.GetBytes(combined);
-                byte[] hashBytes = SHA512.HashData(inputBytes);
-                string actualHash = Convert.ToHexString(hashBytes);
-                //Console.WriteLine($"[ОТЛАДКА] Вычисленный хеш: {actualHash}");
+                // 5. Проверяем целостность каждой части
+                if (!VerifyHmac(part1, salt1, hmac1) || !VerifyHmac(part2, salt2, hmac2))
+                    return null;
 
-                // 6. Сравниваем
-                bool result = string.Equals(actualHash, expectedHash, StringComparison.Ordinal);
-                //Console.WriteLine($"[ОТЛАДКА] Результат сравнения: {result}");
-                return result;
+                // 6. Собираем мастер-ключ
+                byte[] masterKey = new byte[MasterKeySize];
+                Buffer.BlockCopy(part1, 0, masterKey, 0, HalfKeySize);
+                Buffer.BlockCopy(part2, 0, masterKey, HalfKeySize, HalfKeySize);
+
+                // 7. Проверяем по эталону
+                byte[] hash = SHA512.HashData(masterKey);
+                string actualHash = Convert.ToHexString(hash);
+                if (!string.Equals(actualHash, expectedHash, StringComparison.Ordinal))
+                    return null;
+
+                return masterKey;
             }
-            catch (Exception ex)
+            catch
             {
-                Console.WriteLine($"[ОШИБКА] {ex.Message}");
-                return false;
+                return null;
             }
         }
-    }
-}
 
-namespace CreateSertificate
-{
-    public static class CS
-    {
-        public static void Master_CS()
+        private static bool VerifyHmac(byte[] data, byte[] salt, byte[] expectedHmac)
         {
-            // Сбор системной информации (метод существует)
-            CertGuard.Services.SystemInfoService.SaveAllSystemInfo();
+            byte[] combined = new byte[data.Length + salt.Length];
+            Buffer.BlockCopy(data, 0, combined, 0, data.Length);
+            Buffer.BlockCopy(salt, 0, combined, data.Length, salt.Length);
 
-            // Читаем файлы с информацией о системе
-            string cpuinfo = File.ReadAllText("cpuinfo").Trim();
-            string diskusage = File.ReadAllText("diskusage").Trim();
-            string meminfo = File.ReadAllText("meminfo").Trim();
-
-            // Формируем исходную строку и вычисляем SHA-512
-            string stringForHashing = cpuinfo + diskusage + meminfo;
-            byte[] inputBytes = Encoding.UTF8.GetBytes(stringForHashing);
-            byte[] hashBytes = SHA512.HashData(inputBytes);
-            string hashString = Convert.ToHexString(hashBytes);
-
-            // Делим хеш пополам
-            int halfLength = hashString.Length / 2;
-            string firstPart = hashString.Substring(0, halfLength);
-            string secondPart = hashString.Substring(halfLength);
-
-            // Записываем первую часть в сертификат устройства
-            string devicePath = File.ReadAllText("/mnt/temp/Device").Trim();
-            string deviceCertPath = Path.Combine(devicePath, "certificate.cer");
-            File.WriteAllText(deviceCertPath, firstPart.Trim());
-
-            // Записываем вторую часть в системный сертификат
-            string systemCertPath = "/home/kirill/.local/share/nautilus/tags/meta.dbnew";
-            File.WriteAllText(systemCertPath, secondPart.Trim());
-
-            // Хешируем объединённый хеш и записываем в .WPS_Setting
-            byte[] hashBytes2 = SHA512.HashData(Encoding.UTF8.GetBytes(hashString));
-            string finalHash = Convert.ToHexString(hashBytes2);
-            File.WriteAllText(".WPS_Setting", finalHash.Trim());
-
-            Console.WriteLine("[УСПЕХ] Сертификаты и ключ успешно созданы.");
+            byte[] hmacKey = Encoding.UTF8.GetBytes("MySuperSecretHmacKeyForCertGuard");
+            using (var hmac = new HMACSHA256(hmacKey))
+            {
+                byte[] computed = hmac.ComputeHash(combined);
+                return computed.SequenceEqual(expectedHmac);
+            }
         }
     }
 }
