@@ -13,7 +13,8 @@ namespace FileCrypto;
 ///   pwdKey = Argon2id(password, salt)
 ///   wrappedByCert = RSA-OAEP-SHA256(DEK, cert.PublicKey)
 ///   wrappedKeyEnc = AES-GCM(pwdKey, wrappedByCert)
-///   backupCipher  = AES-GCM(backupKey, DEK)   // для резервного пути
+///   backupCipher  = AES-GCM(backupKey, DEK)
+///   recoveryCipher = AES-GCM(recoveryKey, DEK)
 ///   чанки: AES-GCM(DEK, plaintext, AAD=header+index)
 /// </summary>
 public static class CryptoModule
@@ -28,7 +29,7 @@ public static class CryptoModule
 
     private static readonly byte[] Magic = "CGRD"u8.ToArray();
 
-    // Argon2id — OWASP recommended
+    // Argon2id
     private const int Argon2MemoryKiB = 65536;   // 64 MiB
     private const int Argon2Iterations = 3;
     private const int Argon2Parallelism = 4;
@@ -40,7 +41,8 @@ public static class CryptoModule
         string outputPath,
         string password,
         X509Certificate2 cert,
-        byte[] backupKey)
+        byte[] backupKey,
+        string[]? recoveryAnswers = null)
     {
         if (cert is null)
             throw new ArgumentNullException(nameof(cert));
@@ -53,12 +55,33 @@ public static class CryptoModule
         byte[] noncePwd = RandomNumberGenerator.GetBytes(NonceSize);
         byte[] pwdKey = DeriveKey(password, salt);
 
+        byte[] recoveryNonce = new byte[NonceSize];
+        byte[] recoveryTag = new byte[TagSize];
+        byte[] recoveryCipher = Array.Empty<byte>();
+
         try
         {
-            // 1. Заворачиваем DEK публичным ключом сертификата
+            // 1) Ключ восстановления по 3 вопросам
+            if (recoveryAnswers is not null)
+            {
+                byte[] recoveryKey = RecoverySecrets.DeriveKeyFromAnswers(recoveryAnswers);
+                recoveryCipher = new byte[KeySize];
+
+                try
+                {
+                    using var aesRecovery = new AesGcm(recoveryKey, TagSize);
+                    aesRecovery.Encrypt(recoveryNonce, dek, recoveryCipher, recoveryTag);
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(recoveryKey);
+                }
+            }
+
+            // 2) Заворачиваем DEK публичным ключом сертификата
             byte[] wrappedByCert = CertificateService.WrapKey(dek, cert);
 
-            // 2. Дополнительно шифруем это парольным ключом (AES-GCM)
+            // 3) Дополнительно шифруем DEK парольным ключом (AES-GCM)
             byte[] tagPwd = new byte[TagSize];
             byte[] wrappedKeyEnc = new byte[wrappedByCert.Length];
 
@@ -72,7 +95,7 @@ public static class CryptoModule
                 CryptographicOperations.ZeroMemory(wrappedByCert);
             }
 
-            // 3. Параллельно заворачиваем DEK резервным ключом
+            // 4) Резервный backupKey
             byte[] backupNonce = RandomNumberGenerator.GetBytes(NonceSize);
             byte[] backupTag = new byte[TagSize];
             byte[] backupCipher = new byte[BackupWrappedSize];
@@ -92,7 +115,8 @@ public static class CryptoModule
             byte[] header = BuildHeader(
                 salt, noncePwd, tagPwd, wrappedKeyEnc,
                 backupNonce, backupTag, backupCipher,
-                baseNonce, chunkCount);
+                baseNonce, chunkCount,
+                recoveryNonce, recoveryTag, recoveryCipher);
 
             using var input = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
@@ -114,8 +138,10 @@ public static class CryptoModule
             }
 
             if (!wroteAny)
+            {
                 EncryptChunk(aes, baseNonce, 0, header,
                     ReadOnlySpan<byte>.Empty, output);
+            }
         }
         finally
         {
@@ -201,6 +227,45 @@ public static class CryptoModule
         DecryptBody(input, outputPath, h, dek);
     }
 
+    // ===================== DECRYPT через 3 вопроса =====================
+
+    public static void DecryptWithRecovery(
+        string inputPath,
+        string outputPath,
+        string[] answers)
+    {
+        if (answers == null || answers.Length != RecoverySecrets.Questions.Length)
+            throw new ArgumentException("Нужно указать ровно 3 ответа на вопросы восстановления.", nameof(answers));
+
+        using var input = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        Header h = ReadHeader(input);
+
+        if (h.RecoveryCipher.Length == 0)
+            throw new CryptographicException("Этот файл не создан с восстановлением по вопросам.");
+
+        byte[] recoveryKey = RecoverySecrets.DeriveKeyFromAnswers(answers);
+        byte[] dek = new byte[KeySize];
+
+        try
+        {
+            try
+            {
+                using var aesRecovery = new AesGcm(recoveryKey, TagSize);
+                aesRecovery.Decrypt(h.RecoveryNonce, h.RecoveryCipher, h.RecoveryTag, dek);
+            }
+            catch (CryptographicException)
+            {
+                throw new CryptographicException("Неверные ответы на вопросы восстановления.");
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(recoveryKey);
+        }
+
+        DecryptBody(input, outputPath, h, dek);
+    }
+
     // ===================== Общая часть расшифровки =====================
 
     private static void DecryptBody(
@@ -270,12 +335,17 @@ public static class CryptoModule
         public byte[] BackupCipher = null!;
         public byte[] BaseNonce = null!;
         public ulong ChunkCount;
+
+        public byte[] RecoveryNonce = null!;
+        public byte[] RecoveryTag = null!;
+        public byte[] RecoveryCipher = null!;
     }
 
     private static byte[] BuildHeader(
         byte[] salt, byte[] noncePwd, byte[] tagPwd, byte[] wrappedKeyEnc,
         byte[] backupNonce, byte[] backupTag, byte[] backupCipher,
-        byte[] baseNonce, ulong chunkCount)
+        byte[] baseNonce, ulong chunkCount,
+        byte[] recoveryNonce, byte[] recoveryTag, byte[] recoveryCipher)
     {
         using var ms = new MemoryStream();
         using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
@@ -293,6 +363,12 @@ public static class CryptoModule
             bw.Write(baseNonce);
             bw.Write(ChunkSize);
             bw.Write(chunkCount);
+
+            // Блок восстановления по вопросам
+            bw.Write(recoveryNonce);
+            bw.Write(recoveryTag);
+            bw.Write(recoveryCipher.Length);
+            bw.Write(recoveryCipher);
         }
         return ms.ToArray();
     }
@@ -353,10 +429,28 @@ public static class CryptoModule
         ReadExact(input, chunkCountBuf);
         h.ChunkCount = BinaryPrimitives.ReadUInt64LittleEndian(chunkCountBuf);
 
+        // Читаем recovery block
+        h.RecoveryNonce = new byte[NonceSize];
+        ReadExact(input, h.RecoveryNonce);
+
+        h.RecoveryTag = new byte[TagSize];
+        ReadExact(input, h.RecoveryTag);
+
+        byte[] recoveryLenBuf = new byte[4];
+        ReadExact(input, recoveryLenBuf);
+        int recoveryLen = BinaryPrimitives.ReadInt32LittleEndian(recoveryLenBuf);
+
+        if (recoveryLen < 0 || recoveryLen > 8192)
+            throw new CryptographicException("Повреждён блок восстановления.");
+
+        h.RecoveryCipher = new byte[recoveryLen];
+        ReadExact(input, h.RecoveryCipher);
+
         h.RawHeader = BuildHeader(
             h.Salt, h.NoncePwd, h.TagPwd, h.WrappedKeyEnc,
             h.BackupNonce, h.BackupTag, h.BackupCipher,
-            h.BaseNonce, h.ChunkCount);
+            h.BaseNonce, h.ChunkCount,
+            h.RecoveryNonce, h.RecoveryTag, h.RecoveryCipher);
 
         return h;
     }

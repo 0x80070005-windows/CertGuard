@@ -1,13 +1,12 @@
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using CertGuard.Init;
+using CertGuard.Security;
 using FileCrypto;
 
 // ============================================================
 //  Инициализация.
 //  Здесь пароль PFX спрашивается ОДИН РАЗ за весь запуск.
-//  После успешной проверки сертификат кладётся в
-//  Initializer.SessionCertificate и больше не запрашивается.
 // ============================================================
 Initializer.master_init();
 
@@ -31,18 +30,42 @@ static void HandleFileOpen(string filePath)
 
     X509Certificate2? cert = Initializer.SessionCertificate;
 
-    if (cert == null)
+    // 1) Обычный путь: пароль + сертификат
+    if (cert != null)
     {
-        HandleBackupDecrypt(filePath);
+        string? password = AskPasswordOrFail("Введите пароль для расшифровки: ");
+        if (password == null) return;
+
+        try
+        {
+            DoDecrypt(filePath, password, cert);
+            Console.WriteLine("Нажмите Enter для выхода...");
+            Console.ReadLine();
+            return;
+        }
+        catch (Exception)
+        {
+            Console.WriteLine("Пароль неверный или сертификат не подходит.");
+        }
+    }
+
+    // 2) Резервный путь: backupKey
+    if (TryDecryptWithBackupKey(filePath))
+    {
         Console.WriteLine("Нажмите Enter для выхода...");
         Console.ReadLine();
         return;
     }
 
-    string? password = AskPasswordOrFail("Введите пароль для расшифровки: ");
-    if (password == null) return;
+    // 3) Восстановление по 3 вопросам
+    if (TryDecryptWithRecovery(filePath))
+    {
+        Console.WriteLine("Нажмите Enter для выхода...");
+        Console.ReadLine();
+        return;
+    }
 
-    DoDecrypt(filePath, password, cert);
+    Console.WriteLine("Не удалось расшифровать файл.");
     Console.WriteLine("Нажмите Enter для выхода...");
     Console.ReadLine();
 }
@@ -100,10 +123,13 @@ static void EncryptFile()
         string? password = AskPasswordOrFail("Введите пароль для файла: ");
         if (password == null) return;
 
+        Console.WriteLine("Ответьте на 3 вопроса восстановления:");
+        string[] recoveryAnswers = RecoverySecrets.AskQuestions();
+
         string encryptedFile = inputFile + ".enc";
 
         Console.WriteLine("Идёт шифрование (Argon2id 64 MiB × 3 итерации)...");
-        CryptoModule.Encrypt(inputFile, encryptedFile, password, cert, backupKey);
+        CryptoModule.Encrypt(inputFile, encryptedFile, password, cert, backupKey, recoveryAnswers);
         Console.WriteLine($"✓ Файл зашифрован: {encryptedFile}");
     }
     catch (Exception ex)
@@ -134,23 +160,33 @@ static void DecryptFile()
         return;
     }
 
-    if (cert == null)
+    if (cert != null)
     {
-        HandleBackupDecrypt(inputFile);
-        return;
+        string? password = AskPasswordOrFail("Введите пароль для расшифровки: ");
+        if (password == null) return;
+
+        try
+        {
+            DoDecrypt(inputFile, password, cert);
+            return;
+        }
+        catch (Exception)
+        {
+            Console.WriteLine("Пароль неверный или сертификат не подходит.");
+        }
     }
 
-    string? password = AskPasswordOrFail("Введите пароль для расшифровки: ");
-    if (password == null) return;
+    if (TryDecryptWithBackupKey(inputFile))
+        return;
 
-    DoDecrypt(inputFile, password, cert);
+    TryDecryptWithRecovery(inputFile);
 }
 
 // ===================== Резервный ключ =====================
 
 static byte[]? GetBackupKeyOrFail()
 {
-    Console.Write("Введите резервный мастер-ключ (hex) или оставьте пустым для отмены: ");
+    Console.Write("Введите резервный мастер-ключ (32 байта / 64 hex символа): ");
     string? input = Console.ReadLine()?.Trim();
 
     if (string.IsNullOrEmpty(input))
@@ -164,7 +200,7 @@ static byte[]? GetBackupKeyOrFail()
         byte[] key = Convert.FromHexString(input);
         if (key.Length != 32)
         {
-            Console.WriteLine("Ключ должен быть 64 шестнадцатеричных символа.");
+            Console.WriteLine("Ключ должен быть 32 байта (64 hex символа).");
             return null;
         }
         return key;
@@ -176,28 +212,66 @@ static byte[]? GetBackupKeyOrFail()
     }
 }
 
-// ===================== Расшифровка через резервный ключ =====================
-
-static void HandleBackupDecrypt(string inputFile)
+static bool TryDecryptWithBackupKey(string inputFile)
 {
-    Console.WriteLine("Сертификат недоступен. Используется резервный мастер-ключ.");
+    Console.WriteLine("Пробуем расшифровать через backupKey...");
     byte[]? backupKey = GetBackupKeyOrFail();
-    if (backupKey == null) return;
+    if (backupKey == null) return false;
 
     try
     {
         string outputFile = Path.ChangeExtension(inputFile, null);
-        Console.WriteLine("Идёт расшифровка (резервный ключ)...");
+        Console.WriteLine("Идёт расшифровка (backupKey)...");
         CryptoModule.DecryptWithBackupKey(inputFile, outputFile, backupKey);
         Console.WriteLine($"✓ Файл успешно расшифрован: {outputFile}");
+        return true;
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"ОШИБКА расшифровки: {ex.Message}");
+        Console.WriteLine($"Не удалось расшифровать через backupKey: {ex.Message}");
+        return false;
     }
     finally
     {
         CryptographicOperations.ZeroMemory(backupKey);
+    }
+}
+
+static bool TryDecryptWithRecovery(string inputFile)
+{
+    try
+    {
+        Console.WriteLine("Пытаемся восстановить доступ по 3 вопросам...");
+        var recovery = RecoverySecrets.AskRecoveryData();
+
+        // Сначала пробуем backupKey, если он был введён
+        if (recovery.BackupKey != null)
+        {
+            try
+            {
+                string outputFile = Path.ChangeExtension(inputFile, null);
+                Console.WriteLine("Идёт расшифровка через backupKey из восстановления...");
+                CryptoModule.DecryptWithBackupKey(inputFile, outputFile, recovery.BackupKey);
+                Console.WriteLine($"✓ Файл успешно расшифрован: {outputFile}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"backupKey из восстановления не подошёл: {ex.Message}");
+            }
+        }
+
+        // Затем пробуем только 3 вопроса
+        string outputFile2 = Path.ChangeExtension(inputFile, null);
+        Console.WriteLine("Идёт расшифровка через 3 вопроса...");
+        CryptoModule.DecryptWithRecovery(inputFile, outputFile2, recovery.Answers);
+        Console.WriteLine($"✓ Файл успешно расшифрован: {outputFile2}");
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Не удалось восстановить файл: {ex.Message}");
+        return false;
     }
 }
 
@@ -218,16 +292,9 @@ static string? AskPasswordOrFail(string prompt)
 static void DoDecrypt(string filePath, string password, X509Certificate2 cert)
 {
     string outputFile = Path.ChangeExtension(filePath, null);
-    try
-    {
-        Console.WriteLine("Идёт расшифровка (Argon2id 64 MiB × 3 итерации)...");
-        CryptoModule.Decrypt(filePath, outputFile, password, cert);
-        Console.WriteLine($"✓ Файл успешно расшифрован: {outputFile}");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"ОШИБКА расшифровки: {ex.Message}");
-    }
+    Console.WriteLine("Идёт расшифровка (Argon2id 64 MiB × 3 итерации)...");
+    CryptoModule.Decrypt(filePath, outputFile, password, cert);
+    Console.WriteLine($"✓ Файл успешно расшифрован: {outputFile}");
 }
 
 static string? CleanPath(string? input)

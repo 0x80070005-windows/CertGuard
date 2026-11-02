@@ -14,6 +14,22 @@ public static class CertificateGenerator
         if (!Directory.Exists(privateDir))
             Directory.CreateDirectory(privateDir);
 
+        string publicCertPath = Path.Combine(publicCertDir, "certificate.cer");
+        string pfxPath = Path.Combine(privateDir, "certguard.pfx");
+
+        // ============================================================
+        // 🛑 ГЛАВНЫЙ ПРЕДОХРАНИТЕЛЬ
+        // Если файлы уже есть, мы НЕ перезаписываем их, а падаем с ошибкой.
+        // ============================================================
+        if (File.Exists(publicCertPath) || File.Exists(pfxPath))
+        {
+            throw new InvalidOperationException(
+                "КРИТИЧЕСКАЯ ОШИБКА: Сертификаты уже существуют! " +
+                "Программа остановлена, чтобы не уничтожить ваши ключи. " +
+                "Если вы действительно хотите создать новую пару ключей, " +
+                "удалите старые файлы вручную.");
+        }
+
         using var rsa = RSA.Create(4096);
 
         var request = new CertificateRequest(
@@ -37,12 +53,8 @@ public static class CertificateGenerator
             DateTimeOffset.UtcNow.AddDays(-1),
             DateTimeOffset.UtcNow.AddYears(10));
 
-        // Публичный сертификат — на флешку
-        string publicCertPath = Path.Combine(publicCertDir, "certificate.cer");
+        // Теперь мы точно знаем, что файлов нет, и можем их создать
         File.WriteAllBytes(publicCertPath, cert.Export(X509ContentType.Cert));
-
-        // Приватный ключ — PFX в защищённую директорию
-        string pfxPath = Path.Combine(privateDir, "certguard.pfx");
         File.WriteAllBytes(pfxPath, cert.Export(X509ContentType.Pfx, pfxPassword));
 
         if (!OperatingSystem.IsWindows())
@@ -55,7 +67,6 @@ public static class CertificateGenerator
             catch { /* best effort */ }
         }
 
-        // Резервный мастер-ключ (32 случайных байта)
         byte[] backupKey = RandomNumberGenerator.GetBytes(32);
         string backupKeyHex = Convert.ToHexString(backupKey);
         CryptographicOperations.ZeroMemory(backupKey);

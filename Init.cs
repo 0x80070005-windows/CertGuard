@@ -6,10 +6,6 @@ using CertGuard.Security;
 
 namespace CertGuard.Init;
 
-/// <summary>
-/// Инициализация CertGuard: подготовка каталогов, первичная генерация
-/// сертификатов, проверка устройства при каждом запуске.
-/// </summary>
 public static class Initializer
 {
     private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
@@ -18,21 +14,10 @@ public static class Initializer
     private const string PfxFileName = "certguard.pfx";
     private const string DeviceFileName = "Device";
 
-    // Кэш выбранного каталога (чтобы GetCertificateDir() был стабилен между вызовами)
     private static string? _resolvedCertDir;
-
-    // Приватный сертификат текущей сессии
     private static X509Certificate2? _sessionCert;
 
-    // ===================== Публичные свойства =====================
-
-    /// <summary>
-    /// Приватный сертификат текущей сессии. Null, если проверка не выполнялась
-    /// или не удалась. Заполняется один раз в VerifyDeviceCertificate().
-    /// </summary>
     public static X509Certificate2? SessionCertificate => _sessionCert;
-
-    // ===================== Пути =====================
 
     public static string GetCertificateDir()
     {
@@ -97,19 +82,13 @@ public static class Initializer
         catch (IOException ex) { error = ex.Message; return false; }
     }
 
-    public static string GetSettingsFile()
-        => Path.Combine(GetCertificateDir(), ".WPS_Setting");
-
     public static string GetPfxPath()
         => Path.Combine(GetCertificateDir(), PfxFileName);
 
     public static string GetDevicePathFile()
     {
-        string folder = IsWindows ? @"C:\Temp\CertGuard\" : "/mnt/temp/";
-        return Path.Combine(folder, DeviceFileName);
+        return Path.Combine(GetCertificateDir(), DeviceFileName);
     }
-
-    // ===================== Инициализация =====================
 
     public static void master_init()
     {
@@ -118,11 +97,40 @@ public static class Initializer
             string certDir = GetCertificateDir();
             Console.WriteLine($"Каталог сертификатов: {certDir}");
 
-            EnsureTempFolder();
+            // 🟢 ПРОВЕРКА СОСТОЯНИЯ
+            bool pfxExists = File.Exists(GetPfxPath());
+            bool deviceExists = File.Exists(GetDevicePathFile());
 
-            string deviceTemp = GetDevicePathFile();
-            if (!File.Exists(deviceTemp))
+            // 1. Если нет приватного ключа — это либо первый запуск, либо катастрофа
+            if (!pfxExists)
             {
+                if (deviceExists)
+                {
+                    Console.WriteLine("⚠ Приватный ключ (PFX) не найден, но файл Device на месте.");
+                }
+                else
+                {
+                    Console.Write("Введите директорию доверенного устройства " +
+                                  "(заканчивать на / или \\) - ");
+                    string? device = Console.ReadLine();
+                    if (string.IsNullOrWhiteSpace(device))
+                    {
+                        Console.WriteLine("Путь не может быть пустым.");
+                        Environment.Exit(1);
+                    }
+                    File.WriteAllText(GetDevicePathFile(), device.Trim());
+                }
+
+                InitializeFirstTime();
+                return; // После генерации выходим из метода
+            }
+
+            // 2. Если PFX есть, но нет файла Device — восстанавливаем настройки
+            if (!deviceExists)
+            {
+                Console.WriteLine("⚠ Файл конфигурации устройства (Device) утерян.");
+                Console.WriteLine("Приватный ключ (PFX) на месте. Требуется указать путь к флешке.");
+                
                 Console.Write("Введите директорию доверенного устройства " +
                               "(заканчивать на / или \\) - ");
                 string? device = Console.ReadLine();
@@ -131,28 +139,31 @@ public static class Initializer
                     Console.WriteLine("Путь не может быть пустым.");
                     Environment.Exit(1);
                 }
-                File.WriteAllText(deviceTemp, device.Trim());
+                File.WriteAllText(GetDevicePathFile(), device.Trim());
             }
 
-            bool firstRun = !File.Exists(GetSettingsFile());
-            if (firstRun)
+            // 3. Всё на месте (или только что восстановили) — проверяем устройство
+            bool deviceOk = VerifyDeviceCertificate();
+            if (deviceOk)
             {
-                InitializeFirstTime();
+                Console.WriteLine("✓ Устройство подтверждено.");
             }
             else
             {
-                // Пароль спрашивается здесь один раз за весь процесс
-                bool deviceOk = VerifyDeviceCertificate();
-                if (deviceOk)
-                {
-                    Console.WriteLine("✓ Устройство подтверждено.");
-                }
-                else
-                {
-                    Console.WriteLine("⚠ ВНИМАНИЕ: Доверенное устройство не найдено.");
-                    Console.WriteLine("  Можно использовать резервный мастер-ключ.");
-                }
+                Console.WriteLine("⚠ ВНИМАНИЕ: Доверенное устройство не найдено или сертификат не подходит.");
+                Console.WriteLine("  Можно использовать резервный мастер-ключ или секретные вопросы.");
             }
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Ловим ошибку из CertificateGenerator (защита от перезаписи)
+            Console.WriteLine($"\n🛑 {ex.Message}\n");
+            Environment.Exit(1);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"\n🛑 {ex.Message}\n");
+            Environment.Exit(1);
         }
         catch (Exception ex)
         {
@@ -160,47 +171,6 @@ public static class Initializer
             Environment.Exit(1);
         }
     }
-
-    private static void EnsureTempFolder()
-    {
-        string tempFolder = IsWindows ? @"C:\Temp\CertGuard\" : "/mnt/temp/";
-        if (Directory.Exists(tempFolder))
-            return;
-
-        if (OperatingSystem.IsLinux())
-        {
-            try
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "/bin/bash",
-                    Arguments = $"-c \"sudo mkdir -p '{tempFolder}' && sudo chmod 0777 '{tempFolder}'\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using var process = Process.Start(psi);
-                process?.WaitForExit();
-
-                if (process != null && process.ExitCode != 0)
-                {
-                    string err = process.StandardError.ReadToEnd();
-                    Console.WriteLine($"⚠ Не удалось создать {tempFolder}: {err.Trim()}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠ Ошибка при создании {tempFolder}: {ex.Message}");
-            }
-        }
-        else
-        {
-            Directory.CreateDirectory(tempFolder);
-        }
-    }
-
-    // ===================== Первичная генерация =====================
 
     private static void InitializeFirstTime()
     {
@@ -244,17 +214,11 @@ public static class Initializer
 
         string certDir = GetCertificateDir();
 
+        // Если на флешке остался старый certificate.cer, GenerateAndSave выдаст ошибку 
+        // и мы не потеряем данные (защита от перезаписи).
         var (publicCertPath, pfxPath, backupKeyHex) =
             CertificateGenerator.GenerateAndSave(devicePath, certDir, pfxPassword);
 
-        byte[] backupBytes = Convert.FromHexString(backupKeyHex);
-        byte[] backupHash = SHA512.HashData(backupBytes);
-        CryptographicOperations.ZeroMemory(backupBytes);
-
-        File.WriteAllText(GetSettingsFile(), Convert.ToHexString(backupHash));
-        CryptographicOperations.ZeroMemory(backupHash);
-
-        // Сразу загружаем сертификат в сессию, чтобы не спрашивать пароль второй раз
         try
         {
             var publicCert = CertificateService.LoadPublicCertificate(publicCertPath);
@@ -285,22 +249,14 @@ public static class Initializer
         Console.WriteLine("==================================================");
         Console.WriteLine($"📁 Публичный сертификат: {publicCertPath}");
         Console.WriteLine($"📁 Приватный ключ (PFX): {pfxPath}");
-        Console.WriteLine($"📁 Файл настроек:        {GetSettingsFile()}");
         Console.WriteLine("==================================================");
         Console.WriteLine("⚠️  СОХРАНИТЕ РЕЗЕРВНЫЙ КЛЮЧ В НАДЁЖНОМ МЕСТЕ!");
         Console.WriteLine($"Резервный мастер-ключ: {backupKeyHex}");
         Console.WriteLine("==================================================");
     }
 
-    // ===================== Проверка устройства =====================
-
-    /// <summary>
-    /// Загружает и проверяет сертификат. Пароль PFX запрашивается ровно один раз.
-    /// При успехе результат кэшируется в <see cref="SessionCertificate"/>.
-    /// </summary>
     public static bool VerifyDeviceCertificate()
     {
-        // Если уже загружен — не спрашиваем повторно
         if (_sessionCert != null)
             return true;
 
@@ -316,7 +272,10 @@ public static class Initializer
 
             string certPath = Path.Combine(devicePath, CertFileName);
             if (!File.Exists(certPath))
+            {
+                Console.WriteLine($"⚠ Файл {CertFileName} не найден по пути {certPath}");
                 return false;
+            }
 
             string pfxPath = GetPfxPath();
             if (!File.Exists(pfxPath))
@@ -332,6 +291,7 @@ public static class Initializer
 
             if (!CertificateService.ThumbprintsMatch(publicCert, privateCert))
             {
+                Console.WriteLine("⚠ Отпечатки сертификатов не совпадают (флешка от другого устройства?).");
                 publicCert.Dispose();
                 privateCert.Dispose();
                 return false;
@@ -339,6 +299,7 @@ public static class Initializer
 
             if (!CertificateService.VerifyChallengeResponse(publicCert, privateCert))
             {
+                Console.WriteLine("⚠ Проверка цифровой подписи не удалась.");
                 publicCert.Dispose();
                 privateCert.Dispose();
                 return false;
@@ -346,7 +307,6 @@ public static class Initializer
 
             publicCert.Dispose();
 
-            // Кэшируем в сессию — пароль больше не понадобится
             _sessionCert?.Dispose();
             _sessionCert = privateCert;
 
@@ -358,8 +318,6 @@ public static class Initializer
             return false;
         }
     }
-
-    // ===================== Ввод пароля =====================
 
     public static string ReadPassword()
     {
